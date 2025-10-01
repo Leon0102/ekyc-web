@@ -63,4 +63,59 @@ export const detectFace = async (imageFile) => {
   }
 };
 
+// ============= ADMIN APIs =============
+
+const adminApi = axios.create({
+  baseURL: API_BASE_URL,
+  timeout: 30000,
+});
+
+// Add token to admin requests
+adminApi.interceptors.request.use((config) => {
+  const token = localStorage.getItem('admin_token');
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+// Handle 401 errors for admin
+adminApi.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      localStorage.removeItem('admin_token');
+      localStorage.removeItem('admin_username');
+      window.location.href = '/admin';
+    }
+    return Promise.reject(error);
+  }
+);
+
+export const adminLogin = async (username, password) => {
+  const formData = new URLSearchParams();
+  formData.append('username', username);
+  formData.append('password', password);
+
+  const response = await api.post('/admin/login', formData, {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+  });
+  return response.data;
+};
+
+export const getVerifications = async (skip = 0, limit = 50) => {
+  const response = await adminApi.get(`/admin/verifications?skip=${skip}&limit=${limit}`);
+  return response.data;
+};
+
+export const getStats = async () => {
+  const response = await adminApi.get('/admin/stats');
+  return response.data;
+};
+
+export const deleteVerification = async (id) => {
+  const response = await adminApi.delete(`/admin/verifications/${id}`);
+  return response.data;
+};
+
 export default api;

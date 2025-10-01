@@ -1,4 +1,23 @@
 services:
+  # MongoDB Database
+  ekyc-mongodb:
+    image: mongo:7.0
+    container_name: ekyc_mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_DATABASE=ekyc
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - ekyc-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
   # FastAPI Backend
   ekyc-api:
     build:
@@ -13,6 +32,12 @@ services:
       - ./liveness_detection/landmarks:/app/liveness_detection/landmarks:ro
     environment:
       - PYTHONUNBUFFERED=1
+      - MONGODB_URL=mongodb://ekyc-mongodb:27017/ekyc
+      - ADMIN_USERNAME=admin
+      - ADMIN_PASSWORD=admin123
+    depends_on:
+      ekyc-mongodb:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
       interval: 30s
@@ -42,3 +67,7 @@ services:
 networks:
   ekyc-network:
     driver: bridge
+
+volumes:
+  mongodb_data:
+    driver: local

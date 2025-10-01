@@ -3,16 +3,24 @@ eKYC Face Verification API
 REST API for face verification using ID card and selfie images
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, status, Form
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import cv2
 import numpy as np
 from PIL import Image
 import io
 import torch
-from typing import Optional
+from typing import Optional, List
 import logging
+import os
+from datetime import datetime, timedelta
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pymongo import MongoClient
+from bson import ObjectId
+import base64
 
 from face_verification import verify
 from facenet.models.mtcnn import MTCNN
@@ -21,6 +29,18 @@ from verification_models import VGGFace2
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Security
+SECRET_KEY = "ekyc-secret-key-change-in-production-2024"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+
+# Admin credentials (hardcoded)
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
 # Initialize FastAPI
 app = FastAPI(
@@ -42,12 +62,28 @@ app.add_middleware(
 device = None
 mtcnn = None
 verification_model = None
+mongodb_client = None
+db = None
 
 
 @app.on_event("startup")
 async def load_models():
-    """Load ML models on startup"""
-    global device, mtcnn, verification_model
+    """Load ML models and connect to MongoDB on startup"""
+    global device, mtcnn, verification_model, mongodb_client, db
+
+    # Connect to MongoDB
+    mongodb_url = os.getenv("MONGODB_URL", "mongodb://localhost:27017/ekyc")
+    try:
+        mongodb_client = MongoClient(mongodb_url)
+        db = mongodb_client.get_database()
+        logger.info(f"Connected to MongoDB: {mongodb_url}")
+
+        # Create indexes
+        db.verifications.create_index([("timestamp", -1)])
+        db.verifications.create_index([("verified", 1)])
+    except Exception as e:
+        logger.error(f"Failed to connect to MongoDB: {e}")
+        logger.warning("API will work but verification history will not be saved")
 
     logger.info("Loading models...")
 
@@ -90,6 +126,42 @@ def load_image_from_upload(file_content: bytes) -> np.ndarray:
     except Exception as e:
         logger.error(f"Error loading image: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid image format: {str(e)}")
+
+
+def image_to_base64(image_bytes: bytes) -> str:
+    """Convert image bytes to base64 string"""
+    return base64.b64encode(image_bytes).decode('utf-8')
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    """Create JWT access token"""
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify JWT token"""
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Could not validate credentials",
+            )
+        return username
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+        )
 
 
 @app.get("/")
@@ -184,6 +256,24 @@ async def verify_face(
             "message": "Face verification completed successfully"
         }
 
+        # Save to MongoDB
+        if db is not None:
+            try:
+                verification_doc = {
+                    "timestamp": datetime.utcnow(),
+                    "verified": response["verified"],
+                    "confidence": response["confidence"],
+                    "threshold": response["threshold"],
+                    "id_card_filename": id_card.filename,
+                    "selfie_filename": selfie.filename,
+                    "id_card_image": image_to_base64(id_card_content),
+                    "selfie_image": image_to_base64(selfie_content),
+                }
+                db.verifications.insert_one(verification_doc)
+                logger.info(f"Verification saved to database")
+            except Exception as e:
+                logger.error(f"Failed to save verification to database: {e}")
+
         return JSONResponse(content=response)
 
     except HTTPException:
@@ -252,6 +342,185 @@ async def detect_face(
         raise HTTPException(
             status_code=500,
             detail=f"Face detection failed: {str(e)}"
+        )
+
+
+# =============== ADMIN ENDPOINTS ===============
+
+@app.post("/admin/login")
+async def admin_login(
+    username: str = Form(...),
+    password: str = Form(...)
+):
+    """
+    Admin login endpoint
+
+    Args:
+        username: Admin username
+        password: Admin password
+
+    Returns:
+        Access token for admin operations
+    """
+    if username != ADMIN_USERNAME or password != ADMIN_PASSWORD:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password"
+        )
+
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": username}, expires_delta=access_token_expires
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "username": username
+    }
+
+
+@app.get("/admin/verifications")
+async def get_verifications(
+    skip: int = 0,
+    limit: int = 50,
+    username: str = Depends(verify_token)
+):
+    """
+    Get list of all verifications (admin only)
+
+    Args:
+        skip: Number of records to skip (pagination)
+        limit: Maximum number of records to return
+        username: Verified admin username from token
+
+    Returns:
+        List of verification records
+    """
+    if db is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Database not available"
+        )
+
+    try:
+        # Get verifications from database
+        verifications = list(
+            db.verifications
+            .find()
+            .sort("timestamp", -1)
+            .skip(skip)
+            .limit(limit)
+        )
+
+        # Get total count
+        total_count = db.verifications.count_documents({})
+
+        # Convert ObjectId to string
+        for v in verifications:
+            v["_id"] = str(v["_id"])
+            v["timestamp"] = v["timestamp"].isoformat()
+
+        return {
+            "total": total_count,
+            "skip": skip,
+            "limit": limit,
+            "verifications": verifications
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to fetch verifications: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch verifications: {str(e)}"
+        )
+
+
+@app.get("/admin/stats")
+async def get_stats(username: str = Depends(verify_token)):
+    """
+    Get statistics about verifications (admin only)
+
+    Args:
+        username: Verified admin username from token
+
+    Returns:
+        Statistics about verifications
+    """
+    if db is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Database not available"
+        )
+
+    try:
+        total = db.verifications.count_documents({})
+        verified = db.verifications.count_documents({"verified": True})
+        not_verified = db.verifications.count_documents({"verified": False})
+
+        # Get average confidence
+        pipeline = [
+            {"$group": {
+                "_id": None,
+                "avg_confidence": {"$avg": "$confidence"}
+            }}
+        ]
+        avg_result = list(db.verifications.aggregate(pipeline))
+        avg_confidence = avg_result[0]["avg_confidence"] if avg_result else 0
+
+        return {
+            "total_verifications": total,
+            "verified_count": verified,
+            "not_verified_count": not_verified,
+            "verification_rate": (verified / total * 100) if total > 0 else 0,
+            "average_confidence": avg_confidence
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to fetch stats: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch stats: {str(e)}"
+        )
+
+
+@app.delete("/admin/verifications/{verification_id}")
+async def delete_verification(
+    verification_id: str,
+    username: str = Depends(verify_token)
+):
+    """
+    Delete a verification record (admin only)
+
+    Args:
+        verification_id: ID of verification to delete
+        username: Verified admin username from token
+
+    Returns:
+        Success message
+    """
+    if db is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Database not available"
+        )
+
+    try:
+        result = db.verifications.delete_one({"_id": ObjectId(verification_id)})
+
+        if result.deleted_count == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="Verification not found"
+            )
+
+        return {"message": "Verification deleted successfully"}
+
+    except Exception as e:
+        logger.error(f"Failed to delete verification: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete verification: {str(e)}"
         )
 
 
