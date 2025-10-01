@@ -1,0 +1,44 @@
+services:
+  # FastAPI Backend
+  ekyc-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: ekyc_api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount model weights
+      - ./verification_models/weights:/app/verification_models/weights:ro
+      - ./liveness_detection/landmarks:/app/liveness_detection/landmarks:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - ekyc-network
+    restart: unless-stopped
+
+  # React Frontend
+  ekyc-web:
+    build:
+      context: ./ekyc-web
+      dockerfile: Dockerfile
+    container_name: ekyc_web
+    ports:
+      - "3000:80"
+    depends_on:
+      - ekyc-api
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    networks:
+      - ekyc-network
+    restart: unless-stopped
+
+networks:
+  ekyc-network:
+    driver: bridge

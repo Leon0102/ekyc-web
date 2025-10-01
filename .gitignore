@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# PyTorch models
+*.pth
+*.pt
+!facenet/data/*.pt
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Environment variables
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Node
+node_modules/
+ekyc-web/node_modules/
+ekyc-web/dist/
+ekyc-web/.env
+
+# Docker
+.dockerignore
+
+# Test files
+test*.py
+tests/__pycache__/
+
+# Resources
+resources/
+
+# Model weights (too large for git)
+verification_models/weights/*.pth
+verification_models/weights/*.pt
+liveness_detection/landmarks/*.dat
+liveness_detection/landmarks/*.pt
+!liveness_detection/landmarks/.gitkeep
+!verification_models/weights/.gitkeep
